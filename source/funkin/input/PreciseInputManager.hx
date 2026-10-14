@@ -37,6 +37,7 @@ class PreciseInputManager extends FlxKeyManager<FlxKey, PreciseInputList>
 
   public var onInputPressed:FlxTypedSignal<PreciseInputEvent->Void>;
   public var onInputReleased:FlxTypedSignal<PreciseInputEvent->Void>;
+  public var onAnyKeyPressed:FlxTypedSignal<PreciseKeyEvent->Void>;
 
   /**
    * The list of keys that are bound to game inputs (up/down/left/right).
@@ -47,6 +48,11 @@ class PreciseInputManager extends FlxKeyManager<FlxKey, PreciseInputList>
    * The direction that a given key is bound to.
    */
   var _keyListDir:Map<FlxKey, NoteDirection>;
+
+  /**
+   * Tracks physical key state so key repeat events are not reported as new presses.
+   */
+  var _keysDown:Map<Int, Bool>;
 
   /**
    * A FlxGamepadID->Array<FlxGamepadInputID>, with FlxGamepadInputID being the counterpart to FlxKey.
@@ -87,6 +93,7 @@ class PreciseInputManager extends FlxKeyManager<FlxKey, PreciseInputList>
     // _keyListMap
     // _keyListArray
     _keyListDir = new Map<FlxKey, NoteDirection>();
+    _keysDown = new Map<Int, Bool>();
 
     _buttonList = [];
     _buttonListMap = [];
@@ -106,6 +113,7 @@ class PreciseInputManager extends FlxKeyManager<FlxKey, PreciseInputList>
 
     onInputPressed = new FlxTypedSignal<PreciseInputEvent->Void>();
     onInputReleased = new FlxTypedSignal<PreciseInputEvent->Void>();
+    onAnyKeyPressed = new FlxTypedSignal<PreciseKeyEvent->Void>();
   }
 
   public static function getKeysForDirection(controls:Controls, noteDirection:NoteDirection)
@@ -159,6 +167,15 @@ class PreciseInputManager extends FlxKeyManager<FlxKey, PreciseInputList>
     #else
     throw "Eric didn't implement precise timestamps on this platform!";
     #end
+  }
+
+  /**
+   * Converts a current song position into the position at which an input event occurred.
+   */
+  public static function getSongPositionAtInput(currentSongPosition:Float, inputTimestamp:Int64):Float
+  {
+    var inputLatencyNs:Int64 = getCurrentTimestamp() - inputTimestamp;
+    return currentSongPosition - inputLatencyNs.toFloat() / Constants.NS_PER_MS;
   }
 
   static function getPreventDefaultKeys():Array<FlxKey>
@@ -289,6 +306,16 @@ class PreciseInputManager extends FlxKeyManager<FlxKey, PreciseInputList>
   function handleKeyDown(keyCode:KeyCode, _:KeyModifier, timestamp:Int64):Void
   {
     var key:FlxKey = convertKeyCode(keyCode);
+    var keyCodeInt:Int = keyCode;
+    if (!_keysDown.exists(keyCodeInt))
+    {
+      _keysDown.set(keyCodeInt, true);
+      onAnyKeyPressed.dispatch({
+        timestamp: timestamp,
+        keyCode: keyCode
+      });
+    }
+
     if (_keyList.indexOf(key) == -1) return;
 
     updateKeyStates(key, true);
@@ -306,6 +333,8 @@ class PreciseInputManager extends FlxKeyManager<FlxKey, PreciseInputList>
 
   function handleKeyUp(keyCode:KeyCode, _:KeyModifier, timestamp:Int64):Void
   {
+    _keysDown.remove(keyCode);
+
     var key:FlxKey = convertKeyCode(keyCode);
     if (_keyList.indexOf(key) == -1) return;
 
@@ -482,4 +511,17 @@ typedef PreciseInputEvent =
    * Used to help calculate the note timing for the exact time.
    */
   ?position:Float,
+};
+
+typedef PreciseKeyEvent =
+{
+  /**
+   * The timestamp of the key press. Measured in nanoseconds.
+   */
+  timestamp:Int64,
+
+  /**
+   * The physical key that was pressed.
+   */
+  keyCode:Int,
 };

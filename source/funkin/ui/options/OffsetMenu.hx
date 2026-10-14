@@ -11,9 +11,11 @@ import funkin.mobile.input.ControlsHandler;
 import funkin.util.TouchUtil;
 #end
 import funkin.input.PreciseInputManager;
+import funkin.input.PreciseInputManager.PreciseKeyEvent;
 import funkin.audio.FunkinSound;
 import funkin.play.notes.Strumline;
 import funkin.play.notes.NoteSprite;
+import funkin.play.notes.NoteDirection;
 import funkin.graphics.FunkinCamera;
 import funkin.graphics.FunkinSprite;
 import funkin.data.song.SongData.SongNoteData;
@@ -276,6 +278,8 @@ class OffsetMenu extends Page<OptionsState.OptionsMenuPageName>
       offsetLerp = 0;
       savedOffset = Preferences.globalOffset;
       Preferences.globalOffset = 0; // We save the offset and set it to 0 so the player can recalibrate.
+      inputPressQueue = [];
+      inputReleaseQueue = [];
       shouldOffset = 1;
       tempOffset = 0;
       appliedOffsetLerp = 0;
@@ -292,6 +296,8 @@ class OffsetMenu extends Page<OptionsState.OptionsMenuPageName>
       @:privateAccess
       if (OptionsState.instance.optionsCodex.currentPage != this) return;
 
+      inputPressQueue = [];
+      inputReleaseQueue = [];
       shouldOffset = 1;
       testStrumline.clean();
       testStrumline.noteData = [];
@@ -373,6 +379,7 @@ class OffsetMenu extends Page<OptionsState.OptionsMenuPageName>
       }
       #end
     });
+    PreciseInputManager.instance.onAnyKeyPressed.add(onAnyKeyPress);
     PreciseInputManager.instance.onInputPressed.add(onKeyPress);
     PreciseInputManager.instance.onInputReleased.add(onKeyRelease);
 
@@ -387,11 +394,29 @@ class OffsetMenu extends Page<OptionsState.OptionsMenuPageName>
      */
   function onKeyPress(event:PreciseInputEvent):Void
   {
-    // Set the current position for further calculation.
-    event.position = localConductor.songPosition;
+    if (shouldOffset != 1 || calibrating) return;
+
+    event.position = getInputSongPosition(event.timestamp);
 
     // Do the minimal possible work here.
     inputPressQueue.push(event);
+  }
+
+  function onAnyKeyPress(event:PreciseKeyEvent):Void
+  {
+    if (shouldOffset != 1 || !calibrating) return;
+
+    queueCalibrationInput(event.keyCode, event.timestamp);
+  }
+
+  function queueCalibrationInput(keyCode:Int, timestamp:Int64):Void
+  {
+    inputPressQueue.push({
+      noteDirection: NoteDirection.LEFT,
+      timestamp: timestamp,
+      keyCode: keyCode,
+      position: getInputSongPosition(timestamp)
+    });
   }
 
   /**
@@ -399,6 +424,8 @@ class OffsetMenu extends Page<OptionsState.OptionsMenuPageName>
      */
   function onKeyRelease(event:PreciseInputEvent):Void
   {
+    if (shouldOffset != 1) return;
+
     // Set the current position for further calculation.
     event.position = localConductor.songPosition;
 
@@ -412,6 +439,8 @@ class OffsetMenu extends Page<OptionsState.OptionsMenuPageName>
   {
     backButton.enabled = false;
     shouldOffset = -1;
+    inputPressQueue = [];
+    inputReleaseQueue = [];
     #if FEATURE_TOUCH_CONTROLS
     if (OptionsState.instance.hitbox != null) OptionsState.instance.hitbox.visible = false;
     #end
@@ -625,67 +654,20 @@ class OffsetMenu extends Page<OptionsState.OptionsMenuPageName>
         if (differences.length >= 8) createArrow(nextBeat);
       }
 
-      // Hit a note (calibration)
-      if (FlxG.keys.justPressed.ANY #if FEATURE_TOUCH_CONTROLS || TouchUtil.justPressed #end)
+      #if FEATURE_TOUCH_CONTROLS
+      if (TouchUtil.justPressed)
       {
-        var arrow:ArrowData = getClosestArrowAtBeat(b);
-
-        var closestBeat:Float = Math.round(b);
-        var diff:Float = closestBeat - b;
-        var ms:Float = (diff * msPerBeat);
-
-        if (arrow != null) // eric sees this and goes "OMG NULL REF!!!!"
-        {
-          var timeDiff = (arrow.beat - b) * msPerBeat;
-
-          if (Math.abs(timeDiff - tempOffset) <= 80)
-          {
-            arrow.sprite.alpha = 0;
-            arrow.sprite.kill();
-            arrows.remove(arrow);
-          }
-        }
-
-        var consistency:Float = getConsistency();
-
-        if (consistency > 40 && differences.length > 8)
-        {
-          jumpInText.text = 'Try to be a little more consistent with your timing!';
-          differences = [];
-          tempOffset = 0;
-          appliedOffsetLerp = 0;
-          _gotMad = true;
-          return;
-        }
-
-        addDifference(ms);
-
-        var actualMs = ms - tempOffset;
-
-        if (differences.length >= 30)
-        {
-          jumpInText.text = 'Calibration complete!';
-          Preferences.globalOffset = tempOffset;
-          exitCalibration(false);
-          return;
-        }
-
-        if (!_gotMad)
-        {
-          if (Math.abs(actualMs) < 45) jumpInText.text = 'Great job';
-          else
-            jumpInText.text = 'Nice job';
-          if (differences.length < 8) jumpInText.text += ", keep going!";
-          else
-            jumpInText.text += "!";
-        }
-
-        jumpInText.text += '\n' + differences.length + '/30';
-
-        _gotMad = false;
-
-        scaleModifier = 0.75;
+        queueCalibrationInput(0, PreciseInputManager.getCurrentTimestamp());
       }
+      #end
+
+      // Preserve the legacy any-key fallback when no precise key event was queued.
+      if (FlxG.keys.justPressed.ANY && inputPressQueue.length == 0)
+      {
+        queueCalibrationInput(0, PreciseInputManager.getCurrentTimestamp());
+      }
+
+      processInputQueue();
     }
     // Testing logic
     else if (shouldOffset == 1)
@@ -693,6 +675,7 @@ class OffsetMenu extends Page<OptionsState.OptionsMenuPageName>
       // If we are not calibrating, we are just testing the strumline.
 
       processInputQueue();
+
       while (b >= arrowBeat - 2 && b < 124)
       {
         // Create a new arrow at the next beat division.
@@ -827,10 +810,8 @@ class OffsetMenu extends Page<OptionsState.OptionsMenuPageName>
   function hitNote(note:NoteSprite, input:PreciseInputEvent):Void
   {
     var inputPosition:Float = input.position ?? 0.0;
-    var inputLatencyNs:Int64 = PreciseInputManager.getCurrentTimestamp() - input.timestamp;
-    var inputLatencyMs:Float = inputLatencyNs.toFloat() / Constants.NS_PER_MS;
 
-    var noteDiff:Int = Std.int(note.noteData.time - inputPosition - inputLatencyMs);
+    var noteDiff:Int = Std.int(note.noteData.time - inputPosition);
     addDifference(noteDiff);
 
     if (noteDiff == 0)
@@ -852,6 +833,71 @@ class OffsetMenu extends Page<OptionsState.OptionsMenuPageName>
     testStrumline.hitNote(note);
   }
 
+  function getInputSongPosition(inputTimestamp:Int64):Float
+  {
+    var inputPosition:Float = FlxG.sound.music != null && FlxG.sound.music.playing
+      ? localConductor.getTimeWithDiff() + localConductor.combinedOffset
+      : localConductor.songPosition;
+
+    return PreciseInputManager.getSongPositionAtInput(inputPosition, inputTimestamp);
+  }
+
+  function processCalibrationInput(input:PreciseInputEvent):Void
+  {
+    var inputPosition:Float = input.position ?? 0.0;
+    var inputBeat:Float = inputPosition / msPerBeat;
+    var closestBeat:Float = Math.round(inputBeat);
+    var ms:Float = closestBeat * msPerBeat - inputPosition;
+
+    var arrow:ArrowData = getClosestArrowAtBeat(inputBeat);
+    if (arrow != null)
+    {
+      var timeDiff:Float = (arrow.beat - inputBeat) * msPerBeat;
+      if (Math.abs(timeDiff - tempOffset) <= 80)
+      {
+        arrow.sprite.alpha = 0;
+        arrow.sprite.kill();
+        arrows.remove(arrow);
+      }
+    }
+
+    var consistency:Float = getConsistency();
+    if (consistency > 40 && differences.length > 8)
+    {
+      jumpInText.text = 'Try to be a little more consistent with your timing!';
+      differences = [];
+      tempOffset = 0;
+      appliedOffsetLerp = 0;
+      _gotMad = true;
+      return;
+    }
+
+    addDifference(ms);
+    var actualMs:Float = ms - tempOffset;
+
+    if (differences.length >= 30)
+    {
+      jumpInText.text = 'Calibration complete!';
+      Preferences.globalOffset = tempOffset;
+      exitCalibration(false);
+      return;
+    }
+
+    if (!_gotMad)
+    {
+      if (Math.abs(actualMs) < 45) jumpInText.text = 'Great job';
+      else
+        jumpInText.text = 'Nice job';
+      if (differences.length < 8) jumpInText.text += ", keep going!";
+      else
+        jumpInText.text += "!";
+    }
+
+    jumpInText.text += '\n' + differences.length + '/30';
+    _gotMad = false;
+    scaleModifier = 0.75;
+  }
+
   /**
      * PreciseInputEvents are put into a queue between update() calls,
      * and then processed here.
@@ -869,6 +915,12 @@ class OffsetMenu extends Page<OptionsState.OptionsMenuPageName>
     while (inputPressQueue.length > 0)
     {
       var input:PreciseInputEvent = inputPressQueue.shift();
+
+      if (calibrating)
+      {
+        processCalibrationInput(input);
+        continue;
+      }
 
       testStrumline.pressKey(input.noteDirection, input.keyCode);
 
@@ -896,6 +948,8 @@ class OffsetMenu extends Page<OptionsState.OptionsMenuPageName>
     while (inputReleaseQueue.length > 0)
     {
       var input:PreciseInputEvent = inputReleaseQueue.shift();
+
+      if (calibrating) continue;
 
       // Play the strumline animation.
       testStrumline.playStatic(input.noteDirection);
@@ -950,6 +1004,9 @@ class OffsetMenu extends Page<OptionsState.OptionsMenuPageName>
     MenuTypedList.pauseInput = false;
     destroying = true;
     exitCalibration(true);
+    PreciseInputManager.instance.onAnyKeyPressed.remove(onAnyKeyPress);
+    PreciseInputManager.instance.onInputPressed.remove(onKeyPress);
+    PreciseInputManager.instance.onInputReleased.remove(onKeyRelease);
     super.destroy();
   }
 }
